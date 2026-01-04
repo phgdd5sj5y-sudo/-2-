@@ -1,148 +1,113 @@
-from aiogram import Bot, Dispatcher, types
-from aiogram.filters import Command
-from datetime import date, timedelta
+import json
+from datetime import date
+import os
 import asyncio
+from aiogram import Bot, Dispatcher
+from aiogram.types import Message
+from aiogram.filters import Command
 
-from config import BOT_TOKEN
-from db import engine, users, deals
-from sqlalchemy import insert, select, func
+# ----------------------------
+# Файл для хранения статистики
+# ----------------------------
+FILE = "stats.json"
+
+# ----------------------------
+# Работа со статистикой
+# ----------------------------
+def load_stats() -> dict:
+    """Загрузить статистику из файла"""
+    if not os.path.exists(FILE):
+        return {}
+    try:
+        with open(FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except json.JSONDecodeError:
+        return {}
+    except Exception as e:
+        print("Ошибка при загрузке stats.json:", e)
+        return {}
+
+def save_stats(data: dict):
+    """Сохранить статистику в файл"""
+    try:
+        with open(FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print("Ошибка при сохранении stats.json:", e)
+
+def add_profit(amount: float):
+    """Добавить прибыль за сегодня"""
+    today = date.today().isoformat()
+    data = load_stats()
+    if today not in data:
+        data[today] = 0.0
+    data[today] += amount
+    save_stats(data)
+    print(f"[DEBUG] Добавлено {amount} ₽. Сегодня всего: {data[today]} ₽")
+
+def get_today_profit() -> float:
+    """Получить прибыль за сегодня"""
+    today = date.today().isoformat()
+    data = load_stats()
+    return data.get(today, 0.0)
+
+# ----------------------------
+# Настройка бота
+# ----------------------------
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+if not BOT_TOKEN:
+    raise RuntimeError("Переменная окружения BOT_TOKEN не установлена!")
 
 bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher()
+dp = Dispatcher(bot)
 
-# ====== ВСПОМОГАТЕЛЬНО ======
-
-def has_access(sub_until):
-    return sub_until and sub_until >= date.today()
-
-# ====== START ======
-
-@dp.message(Command("start"))
-async def start(msg: types.Message):
-    with engine.connect() as conn:
-        user = conn.execute(
-            select(users).where(users.c.tg_id == msg.from_user.id)
-        ).fetchone()
-
-        if not user:
-            conn.execute(
-                insert(users).values(
-                    tg_id=msg.from_user.id,
-                    sub_until=date.today()
-                )
-            )
-
-    await msg.answer(
-        "🤖 P2P Бот\n\n"
+# ----------------------------
+# Обработчики команд
+# ----------------------------
+@dp.message(Command(commands=["start"]))
+async def start(message: Message):
+    await message.reply(
+        "Бот запущен!\n"
         "Команды:\n"
-        "/add — добавить сделку\n"
-        "/stats — статистика\n"
-        "/day — прибыль за день\n\n"
-        "🔒 Для работы нужна подписка"
+        "/add <сумма> — добавить прибыль\n"
+        "/profit — показать прибыль за сегодня\n"
+        "/stats — показать полную статистику"
     )
 
-# ====== ДОБАВЛЕНИЕ СДЕЛКИ ======
+@dp.message(Command(commands=["add"]))
+async def add(message: Message):
+    try:
+        amount = float(message.text.split()[1])
+        add_profit(amount)
+        await message.reply(f"Добавлено {amount} ₽ к прибыли за сегодня.")
+    except (IndexError, ValueError):
+        await message.reply("Использование: /add <сумма> (например: /add 100)")
 
-@dp.message(Command("add"))
-async def add_deal(msg: types.Message):
-    await msg.answer(
-        "Введите данные через пробел:\n\n"
-        "Биржа ЦенаПокупки ЦенаПродажи Начало₽ Расходы₽\n\n"
-        "Пример:\n"
-        "Binance 98.5 100.2 100000 500"
-    )
+@dp.message(Command(commands=["profit"]))
+async def profit(message: Message):
+    today_profit = get_today_profit()
+    if today_profit == 0:
+        await message.reply("❌ Нет сделок за сегодня.")
+    else:
+        await message.reply(f"Прибыль за сегодня: {today_profit} ₽")
 
-@dp.message()
-async def save_deal(msg: types.Message):
-    parts = msg.text.split()
-    if len(parts) != 5:
+@dp.message(Command(commands=["stats"]))
+async def stats(message: Message):
+    data = load_stats()
+    if not data:
+        await message.reply("📂 Статистика пустая, сделок нет.")
         return
+    text = "📊 Статистика по датам:\n"
+    for d, p in sorted(data.items()):
+        text += f"{d}: {p} ₽\n"
+    await message.reply(text)
 
-    exchange, buy, sell, start_rub, expenses = parts
-
-    buy = float(buy)
-    sell = float(sell)
-    start_rub = float(start_rub)
-    expenses = float(expenses)
-
-    spread = (sell - buy) / buy
-    profit = start_rub * spread - expenses
-
-    with engine.connect() as conn:
-        conn.execute(
-            insert(deals).values(
-                tg_id=msg.from_user.id,
-                date=date.today(),
-                exchange=exchange,
-                buy_price=buy,
-                sell_price=sell,
-                start_rub=start_rub,
-                expenses=expenses,
-                spread=spread,
-                profit=profit
-            )
-        )
-
-    await msg.answer(
-        f"✅ Сделка сохранена\n\n"
-        f"📈 Спред: {spread*100:.2f}%\n"
-        f"💰 Прибыль: {profit:.2f} ₽"
-    )
-
-# ====== СТАТИСТИКА ======
-
-@dp.message(Command("stats"))
-async def stats(msg: types.Message):
-    with engine.connect() as conn:
-        total_profit = conn.execute(
-            select(func.sum(deals.c.profit))
-            .where(deals.c.tg_id == msg.from_user.id)
-        ).scalar() or 0
-
-        avg_spread = conn.execute(
-            select(func.avg(deals.c.spread))
-            .where(deals.c.tg_id == msg.from_user.id)
-        ).scalar() or 0
-
-        count = conn.execute(
-            select(func.count())
-            .where(deals.c.tg_id == msg.from_user.id)
-        ).scalar()
-
-        loss = conn.execute(
-            select(func.count())
-            .where(deals.c.tg_id == msg.from_user.id, deals.c.profit < 0)
-        ).scalar()
-
-    await msg.answer(
-        f"📊 Статистика\n\n"
-        f"💰 Общая прибыль: {total_profit:.2f} ₽\n"
-        f"📈 Средний спред: {avg_spread*100:.2f}%\n"
-        f"🔁 Сделок: {count}\n"
-        f"❌ Убыточных: {loss}"
-    )
-
-# ====== ПРИБЫЛЬ ЗА ДЕНЬ ======
-
-@dp.message(Command("day"))
-async def day_profit(msg: types.Message):
-    today = date.today()
-
-    with engine.connect() as conn:
-        profit = conn.execute(
-            select(func.sum(deals.c.profit))
-            .where(deals.c.tg_id == msg.from_user.id, deals.c.date == today)
-        ).scalar() or 0
-
-    await msg.answer(
-        f"📅 Сегодня ({today})\n"
-        f"💰 Прибыль: {profit:.2f} ₽"
-    )
-
-# ====== ЗАПУСК ======
-
+# ----------------------------
+# Запуск бота
+# ----------------------------
 async def main():
-    await dp.start_polling(bot)
+    print("Бот запущен...")
+    await dp.start_polling()
 
 if __name__ == "__main__":
     asyncio.run(main())
