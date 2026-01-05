@@ -1,194 +1,165 @@
-import os, json, asyncio, requests
-from datetime import date
-from aiogram import Bot, Dispatcher, F
-from aiogram.types import (
-    Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
-)
+import os
+import requests
+from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
+from datetime import date
+import asyncio
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-DATA_FILE = "trades.json"
+API_URL = os.getenv("API_URL")  # мы добавим позже
 
-# ===== BYBIT RATE =====
-def get_usdt_rub():
-    try:
-        r = requests.post(
-            "https://api2.bybit.com/fiat/otc/item/online",
-            json={"tokenId":"USDT","currencyId":"RUB","side":"SELL","size":"5","page":"1"},
-            timeout=5
-        )
-        prices = [float(i["price"]) for i in r.json()["result"]["items"]]
-        return sum(prices) / len(prices)
-    except:
-        return 80
+bot = Bot(BOT_TOKEN)
+dp = Dispatcher(storage=MemoryStorage())
 
-# ===== STORAGE =====
-def load():
-    if not os.path.exists(DATA_FILE):
-        return {}
-    with open(DATA_FILE, "r") as f:
-        return json.load(f)
-
-def save(data):
-    with open(DATA_FILE, "w") as f:
-        json.dump(data, f, indent=2)
-
-# ===== FSM =====
+# ---------- FSM ----------
 class TradeFSM(StatesGroup):
     exchange = State()
     buy = State()
     sell = State()
     volume = State()
-    capital = State()
+    start_sum = State()
 
-# ===== BOT =====
-bot = Bot(BOT_TOKEN)
-dp = Dispatcher(storage=MemoryStorage())
-
-# ===== KEYBOARDS =====
+# ---------- КНОПКИ ----------
 def main_kb():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="➕ Добавить сделку", callback_data="add")],
-        [InlineKeyboardButton(text="📜 История", callback_data="history")],
-        [InlineKeyboardButton(text="💰 Прибыль", callback_data="profit")]
-    ])
+    kb = [
+        [types.InlineKeyboardButton(text="➕ Добавить сделку", callback_data="add")],
+        [types.InlineKeyboardButton(text="📜 История", callback_data="history")],
+        [types.InlineKeyboardButton(text="💰 Прибыль", callback_data="profit")],
+        [types.InlineKeyboardButton(text="🌐 Открыть кабинет", callback_data="web")]
+    ]
+    return types.InlineKeyboardMarkup(inline_keyboard=kb)
 
-def period_kb(prefix):
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📅 Сегодня", callback_data=f"{prefix}_today")],
-        [InlineKeyboardButton(text="📆 За всё время", callback_data=f"{prefix}_all")]
-    ])
-
-# ===== START =====
+# ---------- START ----------
 @dp.message(Command("start"))
-async def start(msg: Message):
-    data = load().get(str(msg.from_user.id), [])
-    total = sum(t["profit_usd"] for t in data)
-    rate = get_usdt_rub()
+async def start(msg: types.Message):
+    telegram_id = msg.from_user.id
+    profit = 0
+    try:
+        r = requests.get(f"{API_URL}/profit", params={"telegram_id": telegram_id})
+        profit = r.json().get("profit_usd", 0)
+    except:
+        pass
 
-    await msg.reply(
-        f"Привет, поработаем сегодня?\n\n"
-        f"Твоя прибыль за всё время:\n"
-        f"{round(total,2)} $ ({round(total*rate,2)} ₽)\n\n"
-        f"👇 Выбери действие",
+    await msg.answer(
+        f"Привет, поработаем сегодня?\n"
+        f"Твоя прибыль за всё время: {profit} $\n\n"
+        f"Выбери действие:",
         reply_markup=main_kb()
     )
 
-# ===== ADD TRADE (BUTTON) =====
-@dp.callback_query(F.data == "add")
-async def add_trade(cb: CallbackQuery, state: FSMContext):
-    await cb.message.answer("Биржа?")
+# ---------- ДОБАВИТЬ СДЕЛКУ ----------
+@dp.callback_query(lambda c: c.data == "add")
+async def add_trade(cb: types.CallbackQuery, state: FSMContext):
+    await cb.message.answer("Введите биржу:")
     await state.set_state(TradeFSM.exchange)
-    await cb.answer()
 
 @dp.message(TradeFSM.exchange)
-async def exchange(msg: Message, state: FSMContext):
+async def trade_exchange(msg: types.Message, state: FSMContext):
     await state.update_data(exchange=msg.text)
-    await msg.answer("Курс покупки?")
+    await msg.answer("Введите курс покупки:")
     await state.set_state(TradeFSM.buy)
 
 @dp.message(TradeFSM.buy)
-async def buy(msg: Message, state: FSMContext):
-    await state.update_data(buy=float(msg.text))
-    await msg.answer("Курс продажи?")
+async def trade_buy(msg: types.Message, state: FSMContext):
+    try:
+        buy = float(msg.text.replace(",", "."))
+    except:
+        await msg.answer("Введите число")
+        return
+    await state.update_data(buy=buy)
+    await msg.answer("Введите курс продажи:")
     await state.set_state(TradeFSM.sell)
 
 @dp.message(TradeFSM.sell)
-async def sell(msg: Message, state: FSMContext):
-    await state.update_data(sell=float(msg.text))
-    await msg.answer("Оборот в USDT?")
+async def trade_sell(msg: types.Message, state: FSMContext):
+    try:
+        sell = float(msg.text.replace(",", "."))
+    except:
+        await msg.answer("Введите число")
+        return
+    await state.update_data(sell=sell)
+    await msg.answer("Введите объём:")
     await state.set_state(TradeFSM.volume)
 
 @dp.message(TradeFSM.volume)
-async def volume(msg: Message, state: FSMContext):
-    await state.update_data(volume=float(msg.text))
-    await msg.answer("Начальная сумма? (пример: 1000 USD или 80000 RUB)")
-    await state.set_state(TradeFSM.capital)
+async def trade_volume(msg: types.Message, state: FSMContext):
+    try:
+        volume = float(msg.text.replace(",", "."))
+    except:
+        await msg.answer("Введите число")
+        return
+    await state.update_data(volume=volume)
+    await msg.answer("Введите начальную сумму:")
+    await state.set_state(TradeFSM.start_sum)
 
-@dp.message(TradeFSM.capital)
-async def finish(msg: Message, state: FSMContext):
+@dp.message(TradeFSM.start_sum)
+async def trade_finish(msg: types.Message, state: FSMContext):
+    try:
+        start_sum = float(msg.text.replace(",", "."))
+    except:
+        await msg.answer("Введите число")
+        return
+
     data = await state.get_data()
-    value, currency = msg.text.split()
-    value = float(value)
-    currency = currency.upper()
+    profit = (data["sell"] - data["buy"]) * data["volume"]
 
-    spread = (data["sell"] - data["buy"]) / data["buy"] * 100
-    profit_usd = (data["sell"] - data["buy"]) * data["volume"]
-    rate = get_usdt_rub()
-    profit = profit_usd if currency == "USD" else profit_usd * rate
-
-    trade = {
+    payload = {
         "date": date.today().isoformat(),
         "exchange": data["exchange"],
-        "profit_usd": profit_usd
+        "buy": data["buy"],
+        "sell": data["sell"],
+        "volume": data["volume"],
+        "start_sum": start_sum,
+        "profit_usd": profit
     }
 
-    db = load()
-    db.setdefault(str(msg.from_user.id), []).append(trade)
-    save(db)
+    requests.post(
+        f"{API_URL}/trade",
+        params={"telegram_id": msg.from_user.id},
+        json={"trade_data": payload}
+    )
+
+    await msg.answer(
+        f"Сделка сохранена ✅\n"
+        f"Прибыль: {round(profit, 2)} $",
+        reply_markup=main_kb()
+    )
 
     await state.clear()
-    await msg.answer(
-        f"✅ Сделка сохранена\n\n"
-        f"Спред: {round(spread,2)} %\n"
-        f"Чистая прибыль: {round(profit,2)} {currency}",
-        reply_markup=main_kb()
-    )
 
-# ===== HISTORY =====
-@dp.callback_query(F.data == "history")
-async def history(cb: CallbackQuery):
-    await cb.message.answer("История сделок:", reply_markup=period_kb("history"))
-    await cb.answer()
+# ---------- ПРИБЫЛЬ ----------
+@dp.callback_query(lambda c: c.data == "profit")
+async def profit(cb: types.CallbackQuery):
+    r = requests.get(f"{API_URL}/profit", params={"telegram_id": cb.from_user.id})
+    profit = r.json().get("profit_usd", 0)
+    await cb.message.answer(f"Твоя прибыль: {profit} $", reply_markup=main_kb())
 
-@dp.callback_query(F.data.startswith("history_"))
-async def history_show(cb: CallbackQuery):
-    data = load().get(str(cb.from_user.id), [])
-    if not data:
-        return await cb.message.answer("Сделок нет")
+# ---------- ИСТОРИЯ ----------
+@dp.callback_query(lambda c: c.data == "history")
+async def history(cb: types.CallbackQuery):
+    r = requests.get(f"{API_URL}/trades", params={"telegram_id": cb.from_user.id})
+    trades = r.json().get("trades", [])
 
-    today = date.today().isoformat()
-    if cb.data.endswith("today"):
-        data = [t for t in data if t["date"] == today]
+    if not trades:
+        await cb.message.answer("Сделок нет")
+        return
 
-    text = "📜 История:\n\n"
-    for t in data:
-        text += f"{t['date']} | {round(t['profit_usd'],2)} $\n"
+    text = "История сделок:\n"
+    for t in trades:
+        text += f"{t['date']} | {t['exchange']} | {round(t['profit_usd'],2)} $\n"
 
     await cb.message.answer(text, reply_markup=main_kb())
-    await cb.answer()
 
-# ===== PROFIT =====
-@dp.callback_query(F.data == "profit")
-async def profit(cb: CallbackQuery):
-    await cb.message.answer("Прибыль:", reply_markup=period_kb("profit"))
-    await cb.answer()
+# ---------- ВЕБ ----------
+@dp.callback_query(lambda c: c.data == "web")
+async def web(cb: types.CallbackQuery):
+    url = f"{API_URL.replace('/','')}/web?uid={cb.from_user.id}"
+    await cb.message.answer(f"Твой кабинет:\n{url}")
 
-@dp.callback_query(F.data.startswith("profit_"))
-async def profit_show(cb: CallbackQuery):
-    data = load().get(str(cb.from_user.id), [])
-    if not data:
-        return await cb.message.answer("Сделок нет")
-
-    today = date.today().isoformat()
-    rate = get_usdt_rub()
-
-    if cb.data.endswith("today"):
-        usd = sum(t["profit_usd"] for t in data if t["date"] == today)
-    else:
-        usd = sum(t["profit_usd"] for t in data)
-
-    await cb.message.answer(
-        f"💰 Прибыль:\n\n"
-        f"{round(usd,2)} $ ({round(usd*rate,2)} ₽)",
-        reply_markup=main_kb()
-    )
-    await cb.answer()
-
-# ===== RUN =====
+# ---------- ЗАПУСК ----------
 async def main():
     await dp.start_polling(bot)
 
