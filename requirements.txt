@@ -1,4 +1,6 @@
 aiogram==3.*
-python-dotenv
+fastapi
+uvicorn
 SQLAlchemy
 requests
+python-dotenvs
